@@ -18,6 +18,22 @@ Resources:
     Type: AWS::SQS::Queue
     Properties: {}
 
+  RootQueueGatewayAPIPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Sub ${RootQueue.QueueUrl}
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS:
+                - !Sub ${GatewayResponsePOSTRole.Arn}
+            Action:
+              - sqs:SendMessage
+            Resource: !Sub ${RootQueue.Arn}
+
   GatewayAPI:
     Type: AWS::ApiGateway::RestApi
     Properties:
@@ -34,11 +50,11 @@ Resources:
         properties:
           type:
             type: string
-          body:
+          message:
             type: string
         required:
           - type
-          - body
+          - message
 
   GatewayResource:
     Type: AWS::ApiGateway::Resource
@@ -67,15 +83,7 @@ Resources:
                 - apigateway.amazonaws.com
             Action:
               - sts:AssumeRole
-      Policies:
-        - PolicyName: GatewayResponsePOSTRolePolicy
-          PolicyDocument:
-            Version: "2012-10-17"
-            Statement:
-              - Effect: Allow
-                Action:
-                  - sqs:SendMessage
-                Resource: !Sub ${RootQueue.Arn}
+      Policies: []
 
   GatewayResourcePOST:
     Type: AWS::ApiGateway::Method
@@ -86,6 +94,7 @@ Resources:
         $default: !Sub ${GatewayModel}
       RequestValidatorId: !Sub ${GatewayValidator.RequestValidatorId}
       HttpMethod: POST
+      AuthorizationType: AWS_IAM
       Integration:
         Type: AWS
         Credentials: !Sub ${GatewayResponsePOSTRole.Arn}
@@ -93,12 +102,18 @@ Resources:
         Uri: !Sub arn:aws:apigateway:${AWS::Region}:sqs:path/${AWS::AccountId}/${RootQueue.QueueName}
         PassthroughBehavior: NEVER
         RequestParameters:
-          "integration.request.header.Content-Type": application/x-www-form-urlencoded
+          "integration.request.header.Content-Type": "'application/x-www-form-urlencoded'"
         RequestTemplates:
           "application/json": Action=SendMessage&MessageBody=$input.body
         IntegrationResponses:
           - StatusCode: "200"
             SelectionPattern: 2\d{2}
+            ResponseTemplates:
+              application/json: >
+                {
+                  "message": "Message sent to queue",
+                  "messageAttributes": $input.json('$.SendMessageResponse.SendMessageResult'),
+                }
           - StatusCode: "400"
             SelectionPattern: 4\d{2}
           - StatusCode: "500"
@@ -107,33 +122,129 @@ Resources:
         - StatusCode: "200"
         - StatusCode: "400"
 
-  HelloWorldFunction:
-    Type: AWS::Serverless::Function # More info about Function Resource: https://github.com/awslabs/serverless-application-model/blob/master/versions/2016-10-31.md#awsserverlessfunction
-    Metadata:
-      BuildMethod: go1.x
+  MessagesLogGroup:
+    Type: AWS::Logs::LogGroup
     Properties:
-      CodeUri: hello-world/
-      Handler: bootstrap
-      Runtime: provided.al2
-      Architectures:
-        - x86_64
-      Events:
-        CatchAll:
-          Type: Api # More info about API Event Source: https://github.com/awslabs/serverless-application-model/blob/master/versions/2016-10-31.md#api
-          Properties:
-            Path: /hello
-            Method: GET
-      Environment: # More info about Env Vars: https://github.com/awslabs/serverless-application-model/blob/master/versions/2016-10-31.md#environment-object
-        Variables:
-          PARAM1: VALUE
+      RetentionInDays: 1
+      LogGroupName: sqs-split-eb-messages
+
+  MessagesLogGroup2:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 1
+      LogGroupName: /aws/events/sqs-split-eb-messages
+
+  MessagesBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: MessagesBus
+
+  MessagesLogRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: MessagesLogPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:PutLogEvents
+                  - logs:CreateLogStream
+                Resource: !Sub ${MessagesLogGroup2.Arn}
+
+  MessagesLogRuleDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: MessagesLogRuleDLQ
+
+  MessagesLogRuleDLQPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Sub ${MessagesLogRuleDLQ.QueueUrl}
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+            Action:
+              - sqs:SendMessage
+              - sqs:GetQueueAttributes
+            Resource: !Sub ${MessagesLogRuleDLQ.Arn}
+
+  MessagesLogRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventBusName: !Sub ${MessagesBus.Name}
+      RoleArn: !Sub ${MessagesLogRole.Arn}
+      EventPattern:
+        account:
+          - !Sub ${AWS::AccountId}
+      State: ENABLED
+      Targets:
+        - Arn: !Sub ${MessagesLogGroup2.Arn}
+          Id: MessagesLogTarget
+          DeadLetterConfig:
+            Arn: !Sub ${MessagesLogRuleDLQ.Arn}
+          RetryPolicy:
+            MaximumEventAgeInSeconds: 60
+            MaximumRetryAttempts: 0
+
+  MessagesPipeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - pipes.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: SQSReceive
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !Sub ${RootQueue.Arn}
+        - PolicyName: EventBridgePut
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - events:PutEvents
+                Resource: !Sub ${MessagesBus.Arn}
+
+  MessagesPipe:
+    Type: AWS::Pipes::Pipe
+    Properties:
+      Name: MessagesPipe
+      RoleArn: !Sub ${MessagesPipeRole.Arn}
+      Source: !Sub ${RootQueue.Arn}
+      SourceParameters:
+        SqsQueueParameters:
+          BatchSize: 1
+      Target: !Sub ${MessagesBus.Arn}
 
 Outputs:
-  HelloWorldAPI:
-    Description: "API Gateway endpoint URL for Prod environment for First Function"
-    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/hello/"
-  HelloWorldFunction:
-    Description: "First Lambda Function ARN"
-    Value: !GetAtt HelloWorldFunction.Arn
-  HelloWorldFunctionIamRole:
-    Description: "Implicit IAM Role created for Hello World function"
-    Value: !GetAtt HelloWorldFunctionRole.Arn
+  API:
+    Value: !Sub "https://${GatewayAPI}.execute-api.${AWS::Region}.amazonaws.com/prod/message"
