@@ -58,4 +58,6 @@ Based on [this article](https://medium.com/@pubudusj/split-messages-from-single-
 
 - I **always forget that you must name your CW log group with a prefix of `/aws/events` for the EventBridge to deliver logs to that CW log group**.
 
-  - I have no idea why. I'm configuring this setup at least for the fourth time now, and every time I forget and every time I never find anything in the docs.
+  - I have no idea why. I'm configuring this setup at least for the fourth time now, and every time I forget, and every time I never find anything in the docs.
+
+- Like, **in the case of AWS Lambda and SQS, there is a separate resource for CW log group resource policy**.
